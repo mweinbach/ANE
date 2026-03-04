@@ -41,7 +41,9 @@ from run_qwen35_4b_ane import (
     load_qwen_model,
     patch_qwen_fused_mlps,
     patch_qwen_linears,
+    resolve_kv_cache_dtype,
     resolve_prefill_device,
+    model_runtime_meta,
     _encode_chat_messages,
 )
 from bench_ane_decode_kernels import (
@@ -544,6 +546,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--ane-tile-multiple", type=int, default=256)
     p.add_argument("--ane-min-hidden-tile", type=int, default=512)
     p.add_argument("--dtype", choices=["fp16", "bf16"], default="fp16")
+    p.add_argument("--kv-cache-dtype", choices=["auto", "fp16", "bf16"], default="auto")
     p.add_argument("--powermetrics-sample-rate-ms", type=int, default=500)
     p.add_argument("--powermetrics-samplers", default="cpu_power,gpu_power,ane_power")
     return p.parse_args()
@@ -588,6 +591,12 @@ def main() -> int:
             print(f"[backend] processor unavailable: {vision_preflight_error}", flush=True)
         print(f"[backend] model: {args.model_id} ({args.dtype})", flush=True)
         model = load_qwen_model(args.model_id, torch_dtype, prefill_device)
+        runtime_meta = model_runtime_meta(model)
+        for note in runtime_meta.get("notes", []):
+            print(f"[backend] load note: {note}", flush=True)
+
+    kv_cache_dtype = resolve_kv_cache_dtype(args.kv_cache_dtype, model)
+    kv_cache_dtype_name = str(kv_cache_dtype).replace("torch.", "") if kv_cache_dtype is not None else "model-default"
 
     bridge = ANEBridge(lib_path)
     manager = OffloadManager()
@@ -629,6 +638,10 @@ def main() -> int:
             "vision_processor_ready": processor is not None and PILImage is not None,
             "vision_processor_status": vision_preflight_status,
             "vision_processor_error": vision_preflight_error,
+            "kv_cache_dtype_requested": args.kv_cache_dtype,
+            "kv_cache_dtype_resolved": kv_cache_dtype_name,
+            "model_quant_mode": runtime_meta.get("quant_mode"),
+            "runtime_model_id": runtime_meta.get("runtime_model_id"),
         }
     )
 
@@ -807,6 +820,7 @@ def main() -> int:
                     temperature=temperature,
                     top_p=top_p,
                     top_k=top_k,
+                    kv_cache_dtype=kv_cache_dtype,
                     on_token=on_token,
                 )
             power, power_text = power_session.stop_with_text()
@@ -858,6 +872,8 @@ def main() -> int:
                     "bridge_compiles": bridge.compile_count(),
                     "ane_kernels_compiled": compiled,
                     "multimodal_mode": multimodal_mode,
+                    "kv_cache_dtype": kv_cache_dtype_name,
+                    "model_quant_mode": runtime_meta.get("quant_mode"),
                 }
             )
         except Exception as exc:

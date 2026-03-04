@@ -45,6 +45,7 @@ final class BackendClient {
             "--ane-tile-multiple", "\(config.aneTileMultiple)",
             "--ane-min-hidden-tile", "\(config.aneMinHiddenTile)",
             "--dtype", config.dtype,
+            "--kv-cache-dtype", config.kvCacheDtype,
             "--powermetrics-sample-rate-ms", "\(config.powermetricsSampleRateMs)",
             "--powermetrics-samplers", config.powermetricsSamplers,
         ]
@@ -329,7 +330,11 @@ final class BackendClient {
                 bridgeCompiles: asInt(event["bridge_compiles"]) ?? 0,
                 visionProcessorReady: asBool(event["vision_processor_ready"]) ?? false,
                 visionProcessorStatus: asString(event["vision_processor_status"]) ?? "unknown",
-                visionProcessorError: asString(event["vision_processor_error"])
+                visionProcessorError: asString(event["vision_processor_error"]),
+                kvCacheRequested: asString(event["kv_cache_dtype_requested"]) ?? "auto",
+                kvCacheResolved: asString(event["kv_cache_dtype_resolved"]) ?? "model-default",
+                modelQuantMode: asString(event["model_quant_mode"]),
+                runtimeModelID: asString(event["runtime_model_id"])
             )
             lock.lock()
             isReady = true
@@ -414,7 +419,9 @@ final class BackendClient {
                 powerSeries: powerSeries,
                 bridgeCompiles: asInt(event["bridge_compiles"]) ?? 0,
                 aneKernelsCompiled: asInt(event["ane_kernels_compiled"]) ?? 0,
-                multimodalMode: asString(event["multimodal_mode"])
+                multimodalMode: asString(event["multimodal_mode"]),
+                kvCacheDtype: asString(event["kv_cache_dtype"]),
+                modelQuantMode: asString(event["model_quant_mode"])
             )
             resumeRequest(id: reqID, with: .success(payload))
 
@@ -744,4 +751,3 @@ final class BackendClient {
         askpassScriptURL = nil
     }
 }
-

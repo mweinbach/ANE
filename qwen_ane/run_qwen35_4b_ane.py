@@ -3,9 +3,12 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import hashlib
+import json
 import os
 import re
 import signal
+import shutil
 import subprocess
 import tempfile
 import time
@@ -15,7 +18,20 @@ from typing import Any, Callable, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoConfig, AutoModelForCausalLM, AutoModelForImageTextToText, AutoTokenizer
+
+try:
+    from huggingface_hub import snapshot_download
+except Exception:  # pragma: no cover - optional dependency
+    snapshot_download = None  # type: ignore[assignment]
+
+try:
+    from safetensors import safe_open
+    from safetensors.torch import load_file, save_file
+except Exception:  # pragma: no cover - optional dependency
+    safe_open = None  # type: ignore[assignment]
+    load_file = None  # type: ignore[assignment]
+    save_file = None  # type: ignore[assignment]
 
 from ane_bridge import ANEBridge, ANEKernel
 from shape_policy import select_swiglu_shape
@@ -547,11 +563,239 @@ def _parse_powermetrics_text(text: str) -> PowerMetrics:
     )
 
 
-def load_qwen_model(model_id: str, dtype: torch.dtype, device: torch.device) -> nn.Module:
+def _quant_mode_from_config_obj(config: Any) -> str | None:
+    qcfg = getattr(config, "quantization_config", None)
+    if qcfg is None:
+        return None
+    raw: Any = None
+    if isinstance(qcfg, dict):
+        raw = qcfg.get("quant_method") or qcfg.get("mode")
+    else:
+        raw = getattr(qcfg, "quant_method", None) or getattr(qcfg, "mode", None)
+        if hasattr(raw, "value"):
+            raw = raw.value
+    if not isinstance(raw, str):
+        return None
+    text = raw.strip().lower()
+    if not text:
+        return None
+    if "." in text:
+        text = text.split(".")[-1]
+    return text
+
+
+def _patch_config_quant_mode(config_path: Path) -> tuple[dict[str, Any], bool]:
+    payload = json.loads(config_path.read_text(encoding="utf-8"))
+    qcfg = payload.get("quantization_config")
+    changed = False
+    if isinstance(qcfg, dict) and "quant_method" not in qcfg:
+        mode = qcfg.get("mode")
+        if isinstance(mode, str) and mode:
+            qcfg = dict(qcfg)
+            qcfg["quant_method"] = mode
+            payload["quantization_config"] = qcfg
+            changed = True
+    return payload, changed
+
+
+def _resolve_local_snapshot_dir(model_id: str) -> Path:
+    src = Path(model_id)
+    if src.exists():
+        return src.resolve()
+    if snapshot_download is None:
+        raise RuntimeError(
+            "huggingface_hub is required to adapt MXFP4 repo IDs. "
+            "Install with: pip install huggingface_hub"
+        )
+    local = snapshot_download(repo_id=model_id, resume_download=True)
+    return Path(local).resolve()
+
+
+def _mxfp4_remap_key(key: str) -> str:
+    if key.startswith("language_model.model."):
+        return "model.language_model." + key[len("language_model.model.") :]
+    if key.startswith("vision_tower."):
+        return "model.visual." + key[len("vision_tower.") :]
+    return key
+
+
+def _needs_mxfp4_key_remap(weights_path: Path) -> bool:
+    if safe_open is None:
+        return False
     try:
-        model = AutoModelForCausalLM.from_pretrained(
-            model_id,
-            torch_dtype=dtype,
+        with safe_open(str(weights_path), framework="pt") as sf:
+            keys = sf.keys()
+            if not keys:
+                return False
+            sample = keys[0]
+            return sample.startswith("language_model.model.") or sample.startswith("vision_tower.")
+    except Exception:
+        return False
+
+
+def _ensure_mxfp4_adapted_snapshot(model_id: str) -> tuple[str, list[str]]:
+    if load_file is None or save_file is None:
+        raise RuntimeError(
+            "safetensors is required for MXFP4 adaptation. Install with: pip install safetensors"
+        )
+
+    src_dir = _resolve_local_snapshot_dir(model_id)
+    config_path = src_dir / "config.json"
+    weights_path = src_dir / "model.safetensors"
+    if not config_path.exists() or not weights_path.exists():
+        raise RuntimeError(
+            f"MXFP4 adaptation expects config.json and model.safetensors in {src_dir}"
+        )
+
+    cfg, cfg_changed = _patch_config_quant_mode(config_path)
+    needs_remap = _needs_mxfp4_key_remap(weights_path)
+    if not needs_remap and not cfg_changed:
+        return str(src_dir), ["mxfp4 passthrough (no remap needed)"]
+
+    key = f"{src_dir}:{weights_path.stat().st_size}:{weights_path.stat().st_mtime_ns}:{int(cfg_changed)}:{int(needs_remap)}"
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
+    out_dir = Path.home() / ".cache" / "ane_mxfp4_adapted" / digest
+    ready_marker = out_dir / ".ready"
+    if ready_marker.exists() and (out_dir / "config.json").exists() and (out_dir / "model.safetensors").exists():
+        notes = ["mxfp4 adapted snapshot cache hit"]
+        if needs_remap:
+            notes.append("keys remapped language_model/vision_tower -> model.language_model/model.visual")
+        if cfg_changed:
+            notes.append("quantization_config.quant_method normalized")
+        return str(out_dir), notes
+
+    tmp_dir = out_dir.parent / f".{out_dir.name}.tmp"
+    if tmp_dir.exists():
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+
+    for child in src_dir.iterdir():
+        if child.name == "model.safetensors":
+            continue
+        if child.name == "config.json":
+            continue
+        target = tmp_dir / child.name
+        if child.is_dir():
+            shutil.copytree(child, target)
+        else:
+            shutil.copy2(child, target)
+
+    (tmp_dir / "config.json").write_text(json.dumps(cfg, ensure_ascii=False, indent=4), encoding="utf-8")
+
+    if needs_remap:
+        src_tensors = load_file(str(weights_path))
+        remapped: dict[str, torch.Tensor] = {}
+        for old_key, tensor in src_tensors.items():
+            remapped[_mxfp4_remap_key(old_key)] = tensor
+        save_file(remapped, str(tmp_dir / "model.safetensors"))
+        index_payload = {
+            "metadata": {"total_size": int((tmp_dir / "model.safetensors").stat().st_size)},
+            "weight_map": {k: "model.safetensors" for k in remapped.keys()},
+        }
+        (tmp_dir / "model.safetensors.index.json").write_text(
+            json.dumps(index_payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    else:
+        shutil.copy2(weights_path, tmp_dir / "model.safetensors")
+
+    ready_marker_tmp = tmp_dir / ".ready"
+    ready_marker_tmp.write_text("ok\n", encoding="utf-8")
+    if out_dir.exists():
+        shutil.rmtree(out_dir, ignore_errors=True)
+    tmp_dir.rename(out_dir)
+
+    notes = ["mxfp4 adapted snapshot created"]
+    if needs_remap:
+        notes.append("keys remapped language_model/vision_tower -> model.language_model/model.visual")
+    if cfg_changed:
+        notes.append("quantization_config.quant_method normalized")
+    return str(out_dir), notes
+
+
+def model_runtime_meta(model: nn.Module) -> dict[str, Any]:
+    meta = getattr(model, "_ane_runtime_meta", None)
+    if isinstance(meta, dict):
+        return dict(meta)
+    return {}
+
+
+def resolve_kv_cache_dtype(
+    requested: str,
+    model: nn.Module,
+) -> torch.dtype | None:
+    req = requested.strip().lower()
+    if req == "fp16":
+        return torch.float16
+    if req == "bf16":
+        return torch.bfloat16
+    if req not in {"", "auto"}:
+        raise ValueError(f"unsupported kv cache dtype: {requested}")
+
+    meta = model_runtime_meta(model)
+    quant_mode = str(meta.get("quant_mode") or "").lower()
+    if quant_mode == "mxfp4":
+        # MXFP4 path dequantizes on this runtime; bf16 cache is the stable default.
+        return torch.bfloat16
+    return None
+
+
+def _cast_kv_cache_dtype(past_key_values: Any, target_dtype: torch.dtype | None):
+    if target_dtype is None or past_key_values is None:
+        return past_key_values
+
+    def _cast_tensor(t: Any) -> Any:
+        if torch.is_tensor(t) and t.is_floating_point() and t.dtype != target_dtype:
+            return t.to(dtype=target_dtype)
+        return t
+
+    if isinstance(past_key_values, tuple):
+        out_layers = []
+        for layer in past_key_values:
+            if isinstance(layer, tuple):
+                out_layers.append(tuple(_cast_tensor(x) for x in layer))
+            elif isinstance(layer, list):
+                out_layers.append([_cast_tensor(x) for x in layer])
+            else:
+                out_layers.append(layer)
+        return tuple(out_layers)
+
+    for attr in ("key_cache", "value_cache", "conv_states", "recurrent_states", "ssm_states"):
+        if not hasattr(past_key_values, attr):
+            continue
+        cache_list = getattr(past_key_values, attr)
+        if not isinstance(cache_list, list):
+            continue
+        for idx, value in enumerate(cache_list):
+            casted = _cast_tensor(value)
+            if casted is not value:
+                cache_list[idx] = casted
+    return past_key_values
+
+
+def load_qwen_model(model_id: str, dtype: torch.dtype, device: torch.device) -> nn.Module:
+    runtime_notes: list[str] = []
+    runtime_model_id = model_id
+    try:
+        cfg = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
+        quant_mode = _quant_mode_from_config_obj(cfg)
+
+        if quant_mode == "mxfp4":
+            runtime_model_id, notes = _ensure_mxfp4_adapted_snapshot(model_id)
+            runtime_notes.extend(notes)
+            cfg = AutoConfig.from_pretrained(runtime_model_id, trust_remote_code=True)
+            quant_mode = _quant_mode_from_config_obj(cfg)
+
+        architectures = list(getattr(cfg, "architectures", []) or [])
+        arch0 = architectures[0] if architectures else ""
+        model_loader = (
+            AutoModelForImageTextToText
+            if "ConditionalGeneration" in arch0
+            else AutoModelForCausalLM
+        )
+        model = model_loader.from_pretrained(
+            runtime_model_id,
+            dtype=dtype,
             low_cpu_mem_usage=True,
             trust_remote_code=True,
         )
@@ -565,13 +809,21 @@ def load_qwen_model(model_id: str, dtype: torch.dtype, device: torch.device) -> 
                 "or pip install git+https://github.com/huggingface/transformers.git."
             )
         raise RuntimeError(
-            f"AutoModelForCausalLM failed for {model_id}. "
+            f"Model load failed for {model_id}. "
             "Use a recent transformers build and verify model access. "
             f"Original error: {exc}.{extra}"
         ) from exc
 
     model.to(device)
     model.eval()
+    meta = {
+        "source_model_id": model_id,
+        "runtime_model_id": runtime_model_id,
+        "architecture": (getattr(model.config, "architectures", [""])[0] if getattr(model.config, "architectures", None) else ""),
+        "quant_mode": _quant_mode_from_config_obj(model.config),
+        "notes": runtime_notes,
+    }
+    setattr(model, "_ane_runtime_meta", meta)
     return model
 
 
@@ -682,6 +934,7 @@ def generate_from_inputs(
     top_p: float,
     top_k: int = 0,
     model_inputs: Optional[dict[str, Any]] = None,
+    kv_cache_dtype: torch.dtype | None = None,
     on_token: Optional[Callable[[int, int], None]] = None,
 ) -> Tuple[str, str, TurnPerfMetrics]:
     prompt_tokens = int(input_ids.shape[1])
@@ -699,7 +952,7 @@ def generate_from_inputs(
         t_prefill0 = time.perf_counter()
         out = model(**prefill_kwargs)
         prefill_seconds = time.perf_counter() - t_prefill0
-        past = out.past_key_values
+        past = _cast_kv_cache_dtype(out.past_key_values, kv_cache_dtype)
         next_token = sample_next_token(out.logits[:, -1, :], temperature, top_p, top_k=top_k)
 
         generated_tokens = 0
@@ -720,7 +973,7 @@ def generate_from_inputs(
                 break
 
             out = model(input_ids=next_token.view(1, 1), past_key_values=past, use_cache=True)
-            past = out.past_key_values
+            past = _cast_kv_cache_dtype(out.past_key_values, kv_cache_dtype)
             next_token = sample_next_token(out.logits[:, -1, :], temperature, top_p, top_k=top_k)
             decode_tokens += 1
 
@@ -774,6 +1027,7 @@ def run_one_shot(
     tokenizer,
     args: argparse.Namespace,
     prefill_device: torch.device,
+    kv_cache_dtype: torch.dtype | None,
 ) -> None:
     input_ids, attention_mask = _encode_prompt(tokenizer, args.prompt, prefill_device)
     input_ids, attention_mask = clamp_context_window(input_ids, attention_mask, args.context_window)
@@ -792,6 +1046,7 @@ def run_one_shot(
         temperature=args.temperature,
         top_p=args.top_p,
         top_k=args.top_k,
+        kv_cache_dtype=kv_cache_dtype,
     )
     power = power_session.stop()
     print_turn_metrics(perf, power)
@@ -804,6 +1059,7 @@ def run_chat_repl(
     tokenizer,
     args: argparse.Namespace,
     prefill_device: torch.device,
+    kv_cache_dtype: torch.dtype | None,
 ) -> None:
     print("[chat] Interactive mode. Commands: /exit, /quit, /reset")
     messages: list[dict[str, str]] = []
@@ -849,6 +1105,7 @@ def run_chat_repl(
             temperature=args.temperature,
             top_p=args.top_p,
             top_k=args.top_k,
+            kv_cache_dtype=kv_cache_dtype,
         )
         power = power_session.stop()
         reply = new_text.strip() if new_text.strip() else new_text
@@ -888,6 +1145,12 @@ def parse_args() -> argparse.Namespace:
         choices=["fp16", "bf16"],
         default="fp16",
         help="Load dtype for the HF model",
+    )
+    p.add_argument(
+        "--kv-cache-dtype",
+        choices=["auto", "fp16", "bf16"],
+        default="auto",
+        help="Decode KV-cache dtype override (auto keeps model default; MXFP4 auto defaults to bf16)",
     )
     p.add_argument(
         "--bridge-lib",
@@ -981,6 +1244,14 @@ def main() -> int:
     t0 = time.time()
     model = load_qwen_model(args.model_id, torch_dtype, prefill_device)
     print(f"[load] done in {time.time() - t0:.1f}s")
+    runtime_meta = model_runtime_meta(model)
+    for note in runtime_meta.get("notes", []):
+        print(f"[load] note: {note}")
+    if runtime_meta.get("runtime_model_id") and runtime_meta.get("runtime_model_id") != args.model_id:
+        print(f"[load] runtime model path: {runtime_meta.get('runtime_model_id')}")
+
+    kv_cache_dtype = resolve_kv_cache_dtype(args.kv_cache_dtype, model)
+    kv_cache_desc = str(kv_cache_dtype).replace("torch.", "") if kv_cache_dtype is not None else "model-default"
 
     bridge = ANEBridge(lib_path)
     manager = OffloadManager()
@@ -1027,7 +1298,8 @@ def main() -> int:
     print(
         f"[run] prefill_device={prefill_device.type}, "
         f"decode_backend=ANE/{args.ane_mode}, ane_spatial={args.ane_spatial}, "
-        f"ane_hidden_tile={args.ane_hidden_tile}, ane_shape_policy={args.ane_shape_policy}, "
+        f"ane_hidden_tile={args.ane_hidden_tile}, kv_cache_dtype={kv_cache_desc}, "
+        f"ane_shape_policy={args.ane_shape_policy}, "
         f"ane_sram_target_mb={args.ane_sram_target_mb:.1f}"
     )
     if args.powermetrics and os.geteuid() != 0:
@@ -1035,10 +1307,10 @@ def main() -> int:
 
     try:
         if args.chat:
-            run_chat_repl(model, tokenizer, args, prefill_device)
+            run_chat_repl(model, tokenizer, args, prefill_device, kv_cache_dtype)
         else:
             print("[run] generating...")
-            run_one_shot(model, tokenizer, args, prefill_device)
+            run_one_shot(model, tokenizer, args, prefill_device, kv_cache_dtype)
         compiled = sum(1 for w in manager.wrappers if w.kernel is not None)
         print(f"[run] ane_kernels_compiled={compiled}, bridge_compiles={bridge.compile_count()}")
     finally:

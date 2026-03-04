@@ -60,6 +60,10 @@ struct BackendReadyInfo {
     let visionProcessorReady: Bool
     let visionProcessorStatus: String
     let visionProcessorError: String?
+    let kvCacheRequested: String
+    let kvCacheResolved: String
+    let modelQuantMode: String?
+    let runtimeModelID: String?
 }
 
 struct BackendResponse {
@@ -73,6 +77,8 @@ struct BackendResponse {
     let bridgeCompiles: Int
     let aneKernelsCompiled: Int
     let multimodalMode: String?
+    let kvCacheDtype: String?
+    let modelQuantMode: String?
 }
 
 struct BackendLaunchConfig {
@@ -87,6 +93,7 @@ struct BackendLaunchConfig {
     let aneTileMultiple: Int
     let aneMinHiddenTile: Int
     let dtype: String
+    let kvCacheDtype: String
     let powermetricsSampleRateMs: Int
     let powermetricsSamplers: String
     let requestSudoAccess: Bool
@@ -173,4 +180,3 @@ enum BackendError: LocalizedError {
         }
     }
 }
-
