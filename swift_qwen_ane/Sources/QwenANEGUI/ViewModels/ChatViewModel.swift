@@ -29,6 +29,7 @@ final class ChatViewModel: ObservableObject {
     @Published var aneTileMultiple = 256
     @Published var aneMinHiddenTile = 512
     @Published var dtype = "fp16"
+    @Published var kvCacheDtype = "auto"
 
     @Published var contextWindow = 0
     @Published var maxNewTokens = 256
@@ -58,6 +59,9 @@ final class ChatViewModel: ObservableObject {
     @Published var visionProcessorStatus = "unknown"
     @Published var visionProcessorError = ""
     @Published var latestMultimodalMode = "text"
+    @Published var latestKvCacheDtype = "unknown"
+    @Published var latestModelQuantMode = "unknown"
+    @Published var runtimeModelID = ""
     @Published var autoTuneStatus = "Not tuned"
     @Published var lastAutoTune: AutoTuneResult?
     @Published var lastError = ""
@@ -81,6 +85,9 @@ final class ChatViewModel: ObservableObject {
                 self.visionProcessorReady = info.visionProcessorReady
                 self.visionProcessorStatus = info.visionProcessorStatus
                 self.visionProcessorError = info.visionProcessorError ?? ""
+                self.latestKvCacheDtype = info.kvCacheResolved
+                self.latestModelQuantMode = info.modelQuantMode ?? "none"
+                self.runtimeModelID = info.runtimeModelID ?? self.modelID
                 self.lastError = ""
                 if self.autoTuneOnStartup, !self.startupAutoTuneDidRun, !self.isAutoTuning {
                     self.startupAutoTuneDidRun = true
@@ -109,6 +116,9 @@ final class ChatViewModel: ObservableObject {
         visionProcessorStatus = "unknown"
         visionProcessorError = ""
         latestMultimodalMode = "text"
+        latestKvCacheDtype = "unknown"
+        latestModelQuantMode = "unknown"
+        runtimeModelID = ""
         lastError = ""
 
         let config = BackendLaunchConfig(
@@ -123,6 +133,7 @@ final class ChatViewModel: ObservableObject {
             aneTileMultiple: max(1, aneTileMultiple),
             aneMinHiddenTile: max(1, aneMinHiddenTile),
             dtype: dtype,
+            kvCacheDtype: kvCacheDtype,
             powermetricsSampleRateMs: max(10, powermetricsSampleRateMs),
             powermetricsSamplers: powermetricsSamplers.isEmpty ? "cpu_power,gpu_power,ane_power" : powermetricsSamplers,
             requestSudoAccess: powermetricsEnabled
@@ -281,6 +292,7 @@ final class ChatViewModel: ObservableObject {
         let probeTileMultiple = max(1, aneTileMultiple)
         let probeMinHiddenTile = max(1, aneMinHiddenTile)
         let probeDType = dtype
+        let probeKvCacheDtype = kvCacheDtype
         let probePowermetricsRate = max(10, powermetricsSampleRateMs)
         let probePowermetricsSamplers = powermetricsSamplers.isEmpty ? "cpu_power,gpu_power,ane_power" : powermetricsSamplers
 
@@ -297,6 +309,7 @@ final class ChatViewModel: ObservableObject {
                     aneTileMultiple: probeTileMultiple,
                     aneMinHiddenTile: probeMinHiddenTile,
                     dtype: probeDType,
+                    kvCacheDtype: probeKvCacheDtype,
                     powermetricsSampleRateMs: probePowermetricsRate,
                     powermetricsSamplers: probePowermetricsSamplers
                 )
@@ -543,6 +556,12 @@ final class ChatViewModel: ObservableObject {
                 bridgeCompiles = response.bridgeCompiles
                 aneKernelsCompiled = response.aneKernelsCompiled
                 latestMultimodalMode = response.multimodalMode ?? "text"
+                if let kv = response.kvCacheDtype, !kv.isEmpty {
+                    latestKvCacheDtype = kv
+                }
+                if let quantMode = response.modelQuantMode, !quantMode.isEmpty {
+                    latestModelQuantMode = quantMode
+                }
             } catch {
                 if streamResponses {
                     removeStreamingMessageIfEmpty(id: streamMessageID)
@@ -738,6 +757,7 @@ final class ChatViewModel: ObservableObject {
         aneTileMultiple: Int,
         aneMinHiddenTile: Int,
         dtype: String,
+        kvCacheDtype: String,
         powermetricsSampleRateMs: Int,
         powermetricsSamplers: String
     ) throws -> String {
@@ -759,8 +779,9 @@ final class ChatViewModel: ObservableObject {
         ane_tile_multiple = sys.argv[8]
         ane_min_hidden_tile = sys.argv[9]
         dtype = sys.argv[10]
-        powermetrics_rate = sys.argv[11]
-        powermetrics_samplers = sys.argv[12]
+        kv_cache_dtype = sys.argv[11]
+        powermetrics_rate = sys.argv[12]
+        powermetrics_samplers = sys.argv[13]
 
         def resolve_backend():
             env_script = os.environ.get("QWEN_ANE_BACKEND_SCRIPT", "").strip()
@@ -792,6 +813,7 @@ final class ChatViewModel: ObservableObject {
             "--ane-tile-multiple", ane_tile_multiple,
             "--ane-min-hidden-tile", ane_min_hidden_tile,
             "--dtype", dtype,
+            "--kv-cache-dtype", kv_cache_dtype,
             "--powermetrics-sample-rate-ms", powermetrics_rate,
             "--powermetrics-samplers", powermetrics_samplers,
         ]
@@ -876,6 +898,7 @@ final class ChatViewModel: ObservableObject {
             "\(aneTileMultiple)",
             "\(aneMinHiddenTile)",
             dtype,
+            kvCacheDtype,
             "\(powermetricsSampleRateMs)",
             powermetricsSamplers,
         ]
@@ -920,4 +943,3 @@ final class ChatViewModel: ObservableObject {
         return "Probe OK: prefill=\(prefill) mode=\(mode) vision=\(visionReady) (\(visionStatus)); \(visionError)"
     }
 }
-

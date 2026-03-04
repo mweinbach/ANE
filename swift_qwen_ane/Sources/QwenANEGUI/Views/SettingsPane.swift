@@ -114,6 +114,7 @@ struct SettingsPane: View {
                         pickerRow(title: "Prefill Device", selection: $model.prefillDevice, values: ["mps", "cpu"])
                         pickerRow(title: "ANE Mode", selection: $model.aneMode, values: ["mlp_tiled", "mlp_fused", "linear"])
                         pickerRow(title: "DType", selection: $model.dtype, values: ["fp16", "bf16"])
+                        pickerRow(title: "KV Cache DType", selection: $model.kvCacheDtype, values: ["auto", "fp16", "bf16"])
                         pickerRow(title: "Shape Policy", selection: $model.aneShapePolicy, values: ["auto", "manual"])
                         statsRow(
                             "Vision Processor",
@@ -165,6 +166,9 @@ struct SettingsPane: View {
                         }
                         if let perf = model.latestPerf {
                             statsRow("MM Mode", model.latestMultimodalMode)
+                            statsRow("KV Cache", model.latestKvCacheDtype)
+                            statsRow("Quant Mode", model.latestModelQuantMode)
+                            statsRow("Runtime Model", model.runtimeModelID.isEmpty ? "-" : model.runtimeModelID)
                             statsRow("Prompt Tokens", "\(perf.promptTokens)")
                             statsRow("Generated", "\(perf.generatedTokens)")
                             statsRow("Prefill tok/s", fmt(perf.prefillTPS))
