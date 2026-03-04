@@ -713,6 +713,30 @@ def _ensure_mxfp4_adapted_snapshot(model_id: str) -> tuple[str, list[str]]:
     return str(out_dir), notes
 
 
+def _looks_like_mlx_quantized_model(model_id: str) -> bool:
+    text = model_id.strip().lower()
+    return "mlx-community" in text or "models--mlx-community--" in text
+
+
+def _fallback_model_candidates_for(model_id: str) -> list[str]:
+    if not _looks_like_mlx_quantized_model(model_id):
+        return []
+
+    out: list[str] = []
+    local_qwen_4b = Path.home() / ".cache" / "huggingface" / "hub" / "models--Qwen--Qwen3.5-4B" / "snapshots" / "manual"
+    if local_qwen_4b.exists():
+        out.append(str(local_qwen_4b))
+    out.append("Qwen/Qwen3.5-4B")
+    return out
+
+
+def _sanity_check_model_forward(model: nn.Module, device: torch.device) -> None:
+    # Catch silently-corrupted quantized loads before backend starts serving requests.
+    sanity_ids = torch.tensor([[1, 2, 3]], dtype=torch.long, device=device)
+    with torch.no_grad():
+        _ = model(input_ids=sanity_ids, use_cache=True, return_dict=True)
+
+
 def model_runtime_meta(model: nn.Module) -> dict[str, Any]:
     meta = getattr(model, "_ane_runtime_meta", None)
     if isinstance(meta, dict):
@@ -774,57 +798,80 @@ def _cast_kv_cache_dtype(past_key_values: Any, target_dtype: torch.dtype | None)
 
 
 def load_qwen_model(model_id: str, dtype: torch.dtype, device: torch.device) -> nn.Module:
-    runtime_notes: list[str] = []
-    runtime_model_id = model_id
-    try:
-        cfg = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
-        quant_mode = _quant_mode_from_config_obj(cfg)
+    candidates: list[str] = [model_id]
+    for fb in _fallback_model_candidates_for(model_id):
+        if fb not in candidates:
+            candidates.append(fb)
 
-        if quant_mode == "mxfp4":
-            runtime_model_id, notes = _ensure_mxfp4_adapted_snapshot(model_id)
-            runtime_notes.extend(notes)
-            cfg = AutoConfig.from_pretrained(runtime_model_id, trust_remote_code=True)
+    attempt_errors: list[str] = []
+
+    for candidate_id in candidates:
+        runtime_notes: list[str] = []
+        runtime_model_id = candidate_id
+        try:
+            cfg = AutoConfig.from_pretrained(candidate_id, trust_remote_code=True)
             quant_mode = _quant_mode_from_config_obj(cfg)
 
-        architectures = list(getattr(cfg, "architectures", []) or [])
-        arch0 = architectures[0] if architectures else ""
-        model_loader = (
-            AutoModelForImageTextToText
-            if "ConditionalGeneration" in arch0
-            else AutoModelForCausalLM
-        )
-        model = model_loader.from_pretrained(
-            runtime_model_id,
-            dtype=dtype,
-            low_cpu_mem_usage=True,
-            trust_remote_code=True,
-        )
-    except Exception as exc:
-        extra = ""
-        msg = str(exc)
-        if "model type `qwen3_5`" in msg or "model type 'qwen3_5'" in msg:
-            extra = (
-                " This environment does not include Qwen3.5 architecture support yet. "
-                "Try: pip install --upgrade transformers "
-                "or pip install git+https://github.com/huggingface/transformers.git."
-            )
-        raise RuntimeError(
-            f"Model load failed for {model_id}. "
-            "Use a recent transformers build and verify model access. "
-            f"Original error: {exc}.{extra}"
-        ) from exc
+            if quant_mode == "mxfp4":
+                runtime_model_id, notes = _ensure_mxfp4_adapted_snapshot(candidate_id)
+                runtime_notes.extend(notes)
+                cfg = AutoConfig.from_pretrained(runtime_model_id, trust_remote_code=True)
+                quant_mode = _quant_mode_from_config_obj(cfg)
 
-    model.to(device)
-    model.eval()
-    meta = {
-        "source_model_id": model_id,
-        "runtime_model_id": runtime_model_id,
-        "architecture": (getattr(model.config, "architectures", [""])[0] if getattr(model.config, "architectures", None) else ""),
-        "quant_mode": _quant_mode_from_config_obj(model.config),
-        "notes": runtime_notes,
-    }
-    setattr(model, "_ane_runtime_meta", meta)
-    return model
+            architectures = list(getattr(cfg, "architectures", []) or [])
+            arch0 = architectures[0] if architectures else ""
+            model_loader = (
+                AutoModelForImageTextToText
+                if "ConditionalGeneration" in arch0
+                else AutoModelForCausalLM
+            )
+            model = model_loader.from_pretrained(
+                runtime_model_id,
+                dtype=dtype,
+                low_cpu_mem_usage=True,
+                trust_remote_code=True,
+            )
+
+            model.to(device)
+            model.eval()
+            _sanity_check_model_forward(model, device)
+
+            if candidate_id != model_id:
+                runtime_notes.append(
+                    f"fallback model selected after load/sanity failure for requested model: {candidate_id}"
+                )
+
+            meta = {
+                "source_model_id": model_id,
+                "selected_model_id": candidate_id,
+                "runtime_model_id": runtime_model_id,
+                "architecture": (
+                    getattr(model.config, "architectures", [""])[0]
+                    if getattr(model.config, "architectures", None)
+                    else ""
+                ),
+                "quant_mode": _quant_mode_from_config_obj(model.config),
+                "notes": runtime_notes,
+            }
+            setattr(model, "_ane_runtime_meta", meta)
+            return model
+        except Exception as exc:
+            attempt_errors.append(f"{candidate_id}: {exc.__class__.__name__}: {exc}")
+            continue
+
+    joined = " | ".join(attempt_errors[-3:]) if attempt_errors else "no attempts executed"
+    extra = ""
+    if any("model type `qwen3_5`" in err or "model type 'qwen3_5'" in err for err in attempt_errors):
+        extra = (
+            " This environment does not include Qwen3.5 architecture support yet. "
+            "Try: pip install --upgrade transformers "
+            "or pip install git+https://github.com/huggingface/transformers.git."
+        )
+    raise RuntimeError(
+        f"Model load failed for {model_id}. "
+        "Use a recent transformers build and verify model access. "
+        f"Attempt summary: {joined}.{extra}"
+    )
 
 
 def resolve_prefill_device(name: str) -> torch.device:

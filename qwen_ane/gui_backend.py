@@ -8,6 +8,7 @@ import io
 import json
 import re
 import sys
+import time
 import traceback
 from dataclasses import asdict
 from pathlib import Path
@@ -466,6 +467,112 @@ def _int_list(req_value: Any, fallback: list[int]) -> list[int]:
     return out if out else fallback
 
 
+def _autotune_cache_path() -> Path:
+    return Path.home() / ".cache" / "qwen_ane" / "autotune_runs.json"
+
+
+def _load_autotune_cache(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {"version": 1, "entries": [], "best_by_key": {}}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {"version": 1, "entries": [], "best_by_key": {}}
+    if not isinstance(payload, dict):
+        return {"version": 1, "entries": [], "best_by_key": {}}
+    if not isinstance(payload.get("entries"), list):
+        payload["entries"] = []
+    if not isinstance(payload.get("best_by_key"), dict):
+        payload["best_by_key"] = {}
+    payload["version"] = 1
+    return payload
+
+
+def _write_autotune_cache(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(path)
+
+
+def _autotune_cache_key(source_model_id: str, runtime_model_id: str, mode: str, dim: int, hidden: int) -> str:
+    return f"{source_model_id}|{runtime_model_id}|{mode}|{dim}:{hidden}"
+
+
+def _persist_autotune_result(
+    result: dict[str, Any],
+    args: argparse.Namespace,
+    runtime_meta: dict[str, Any],
+    req_id: Any,
+) -> tuple[str, str, bool]:
+    shape = result.get("shape", {})
+    best = result.get("best", {})
+    dim = int(shape.get("dim", 0) or 0)
+    hidden = int(shape.get("hidden", 0) or 0)
+    source_model_id = str(runtime_meta.get("source_model_id") or args.model_id)
+    runtime_model_id = str(runtime_meta.get("runtime_model_id") or source_model_id)
+    mode = str(result.get("mode") or args.ane_mode)
+    key = _autotune_cache_key(source_model_id, runtime_model_id, mode, dim, hidden)
+    now_ts = time.time()
+
+    cache_path = _autotune_cache_path()
+    payload = _load_autotune_cache(cache_path)
+    entries: list[dict[str, Any]] = payload["entries"]
+    best_by_key: dict[str, Any] = payload["best_by_key"]
+
+    record = {
+        "timestamp": now_ts,
+        "id": str(req_id or ""),
+        "cache_key": key,
+        "source_model_id": source_model_id,
+        "runtime_model_id": runtime_model_id,
+        "mode": mode,
+        "shape": shape,
+        "best": best,
+        "recommended": result.get("recommended"),
+        "candidates": result.get("candidates"),
+        "failures": result.get("failures"),
+        "bridge_compiles": result.get("bridge_compiles"),
+        "settings": {
+            "prefill_device": args.prefill_device,
+            "ane_spatial": args.ane_spatial,
+            "ane_hidden_tile": args.ane_hidden_tile,
+            "ane_shape_policy": args.ane_shape_policy,
+            "dtype": args.dtype,
+            "kv_cache_dtype": args.kv_cache_dtype,
+        },
+    }
+    entries.append(record)
+    if len(entries) > 200:
+        del entries[: len(entries) - 200]
+
+    best_eval_ms = float(best.get("eval_ms", float("inf")))
+    prev = best_by_key.get(key)
+    is_best = True
+    if isinstance(prev, dict):
+        try:
+            prev_eval = float(prev.get("best_eval_ms", float("inf")))
+            is_best = best_eval_ms < prev_eval
+        except Exception:
+            is_best = True
+    if is_best:
+        best_by_key[key] = {
+            "timestamp": now_ts,
+            "best_eval_ms": best_eval_ms,
+            "best_spatial": best.get("spatial"),
+            "best_tile_hidden": best.get("tile_hidden"),
+            "recommended": result.get("recommended"),
+            "shape": shape,
+            "weight_source": shape.get("weight_source"),
+            "source_model_id": source_model_id,
+            "runtime_model_id": runtime_model_id,
+        }
+
+    payload["updated_at"] = now_ts
+    _write_autotune_cache(cache_path, payload)
+    return str(cache_path), key, is_best
+
+
 def _autotune_decode_shape(
     bridge: ANEBridge,
     model: nn.Module,
@@ -724,8 +831,21 @@ def main() -> int:
                         peak_tflops=peak_tflops,
                         seed=seed,
                     )
+                    cache_path, cache_key, cache_is_best = _persist_autotune_result(
+                        result=result,
+                        args=args,
+                        runtime_meta=runtime_meta,
+                        req_id=req_id,
+                    )
+                    print(
+                        f"[backend] autotune cached key={cache_key} best={cache_is_best} path={cache_path}",
+                        flush=True,
+                    )
                 result["event"] = "autotune_result"
                 result["id"] = req_id
+                result["cache_path"] = cache_path
+                result["cache_key"] = cache_key
+                result["cache_is_best"] = cache_is_best
                 emit(result)
                 continue
 
