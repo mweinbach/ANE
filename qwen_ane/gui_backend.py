@@ -392,19 +392,61 @@ def _prepare_multimodal_inputs(
     return input_ids, attention_mask, extra_model_inputs
 
 
-def _find_first_qwen_mlp(model: nn.Module) -> tuple[str, np.ndarray, np.ndarray, np.ndarray, int, int]:
+def _make_synthetic_mlp_weights(dim: int, hidden: int, seed: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    rng = np.random.default_rng(seed)
+    w1 = (rng.standard_normal((hidden, dim), dtype=np.float32) * 0.02).astype(np.float32)
+    w3 = (rng.standard_normal((hidden, dim), dtype=np.float32) * 0.02).astype(np.float32)
+    w2 = (rng.standard_normal((dim, hidden), dtype=np.float32) * 0.02).astype(np.float32)
+    return w1, w3, w2
+
+
+def _find_first_qwen_mlp(
+    model: nn.Module, seed: int
+) -> tuple[str, np.ndarray, np.ndarray, np.ndarray, int, int, str]:
     for name, module in model.named_modules():
         gate = getattr(module, "gate_proj", None)
         up = getattr(module, "up_proj", None)
         down = getattr(module, "down_proj", None)
         if not isinstance(gate, nn.Linear) or not isinstance(up, nn.Linear) or not isinstance(down, nn.Linear):
             continue
+
+        dim = int(gate.in_features)
+        hidden = int(gate.out_features)
+        if dim < 1 or hidden < 1:
+            continue
+
         w1 = gate.weight.detach().cpu().float().numpy()
         w3 = up.weight.detach().cpu().float().numpy()
         w2 = down.weight.detach().cpu().float().numpy()
-        dim = int(gate.in_features)
-        hidden = int(gate.out_features)
-        return name, w1, w3, w2, dim, hidden
+
+        notes: list[str] = []
+        if w1.shape == (dim, hidden) and w3.shape == (dim, hidden):
+            w1 = np.ascontiguousarray(w1.T, dtype=np.float32)
+            w3 = np.ascontiguousarray(w3.T, dtype=np.float32)
+            notes.append("transposed gate/up")
+        else:
+            w1 = np.ascontiguousarray(w1, dtype=np.float32)
+            w3 = np.ascontiguousarray(w3, dtype=np.float32)
+
+        if w2.shape == (hidden, dim):
+            w2 = np.ascontiguousarray(w2.T, dtype=np.float32)
+            notes.append("transposed down")
+        else:
+            w2 = np.ascontiguousarray(w2, dtype=np.float32)
+
+        if w1.shape == (hidden, dim) and w3.shape == (hidden, dim) and w2.shape == (dim, hidden):
+            detail = ", ".join(notes) if notes else "model_weights"
+            return name, w1, w3, w2, dim, hidden, detail
+
+        packed_hint = (
+            w1.shape[1] > 0
+            and w2.shape[1] > 0
+            and w1.shape[1] * 8 == dim
+            and w2.shape[1] * 8 == hidden
+        )
+        source = "synthetic_from_features_packed" if packed_hint else "synthetic_from_features_shape_mismatch"
+        synth_w1, synth_w3, synth_w2 = _make_synthetic_mlp_weights(dim=dim, hidden=hidden, seed=seed)
+        return name, synth_w1, synth_w3, synth_w2, dim, hidden, source
     raise RuntimeError("unable to find qwen gate/up/down projection triplet for autotune")
 
 
@@ -435,7 +477,7 @@ def _autotune_decode_shape(
     peak_tflops: float,
     seed: int,
 ) -> dict[str, Any]:
-    module_name, w1, w3, w2, dim, hidden = _find_first_qwen_mlp(model)
+    module_name, w1, w3, w2, dim, hidden, weight_source = _find_first_qwen_mlp(model, seed=seed)
     rng = np.random.default_rng(seed)
     x = (rng.standard_normal((dim,), dtype=np.float32) * 0.2).astype(np.float16)
     results: list[BenchResult] = []
@@ -514,6 +556,7 @@ def _autotune_decode_shape(
             "module": module_name,
             "dim": dim,
             "hidden": hidden,
+            "weight_source": weight_source,
         },
         "mode": mode_name,
         "warmup": warmup,
